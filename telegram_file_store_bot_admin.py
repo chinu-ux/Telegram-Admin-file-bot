@@ -538,3 +538,20 @@ async def banlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conn = sqlite
+
+from aiohttp import web
+import threading
+
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+def run_web():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    web.run_app(app, port=8080)
+
+# start web server in background thread
+threading.Thread(target=run_web).start()
+
+if __name__ == "__main__":
+    application.run_polling()
