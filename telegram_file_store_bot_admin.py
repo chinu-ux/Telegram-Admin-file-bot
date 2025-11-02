@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram File Store Bot (Final Version ✅)
+Telegram File Store Bot (Fully Fixed ✅)
 -----------------------------------------
 ✅ Admin-only uploads
-✅ User messages expire after 1 hour
-✅ Files stored permanently in private channel
-✅ SQLite local database
-✅ /user command for admin (view stats)
-✅ Force join channel before using bot
+✅ Working share links
+✅ Force-join before access
+✅ SQLite database
+✅ /help and /user commands
+✅ File auto delete (user copy) after 1 hour
 """
 
 import os
@@ -18,7 +18,6 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -29,11 +28,11 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-TOKEN = "8222645012:AAEQMNK31oa5hDo_9OEStfNL7FMBdZMkUFM"
-DB_CHANNEL_ID = -1003292247930
+TOKEN = "YOUR_BOT_TOKEN"
+DB_CHANNEL_ID = -1003292247930  # your private DB channel id
 BOT_USERNAME = "Cornsebot"
 ADMIN_ID = 7681308594
-FORCE_JOIN_CHANNEL = "Cornsehub"  # without @
+FORCE_JOIN_CHANNEL = "Cornsehub"  # channel username without @
 TEMP_EXPIRY_SECONDS = 3600  # 1 hour
 DB_PATH = "files.db"
 
@@ -59,6 +58,7 @@ cur.execute(
 )
 conn.commit()
 
+
 # ---------------- SAVE FILE ----------------
 async def save_file(file_id, file_type, caption):
     cur.execute(
@@ -68,19 +68,52 @@ async def save_file(file_id, file_type, caption):
     conn.commit()
     return cur.lastrowid
 
+
+# ---------------- FORCE JOIN CHECK ----------------
+async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try:
+        member = await context.bot.get_chat_member(f"@{FORCE_JOIN_CHANNEL}", user.id)
+        if member.status in ["member", "administrator", "creator"]:
+            return True
+    except Exception:
+        pass
+
+    join_button = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📢 Join Channel",
+                    url=f"https://t.me/{FORCE_JOIN_CHANNEL}",
+                )
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"Hello 👋 {user.first_name},\n\n"
+        "You need to join my Channel to use me.\n\n"
+        "Please join below 👇",
+        reply_markup=join_button,
+    )
+    return False
+
+
 # ---------------- /start ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_name = user.first_name or "User"
     args = context.args
 
-    # Handle shared file link
+    # handle share links
     if args and args[0].startswith("share_"):
-        file_id = args[0].split("_", 1)[1]
-        await send_file_to_user(update, context, file_id)
+        file_db_id = args[0].split("_", 1)[1]
+        # check join before sending
+        if not await check_join(update, context):
+            return
+        await send_file_to_user(update, context, file_db_id)
         return
 
-    # If admin
+    # admin welcome
     if user.id == ADMIN_ID:
         await update.message.reply_text(
             f"Hello {user_name}!\n"
@@ -88,54 +121,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Force join check
-    try:
-        member = await context.bot.get_chat_member(f"@{FORCE_JOIN_CHANNEL}", user.id)
-        if member.status not in ["member", "administrator", "creator"]:
-            join_button = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "📢 Join My Channel",
-                            url=f"https://t.me/{FORCE_JOIN_CHANNEL}",
-                        )
-                    ]
-                ]
-            )
-            await update.message.reply_text(
-                f"Hello 👋 {user_name},\n\n"
-                "You need to join my Channel to use me.\n\n"
-                "Kindly please join the channel below 👇",
-                reply_markup=join_button,
-            )
-            return
-    except Exception:
-        join_button = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "📢 Join My Channel",
-                        url=f"https://t.me/{FORCE_JOIN_CHANNEL}",
-                    )
-                ]
-            ]
-        )
-        await update.message.reply_text(
-            f"Hello 👋 {user_name},\n\n"
-            "You need to join my Channel to use me.\n\n"
-            "Kindly please join the channel below 👇",
-            reply_markup=join_button,
-        )
+    # check join for user
+    if not await check_join(update, context):
         return
 
-    # Already joined
+    # already joined
     await update.message.reply_text(
         f"Hello 👋 {user_name}!\n\n"
         "I can store private files in a secured channel.\n"
         "Other users can access them using special share links."
     )
 
-# ---------------- FILE HANDLER ----------------
+
+# ---------------- HANDLE FILE (ADMIN) ----------------
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id != ADMIN_ID:
@@ -145,91 +143,93 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     caption = msg.caption or ""
 
-    # Detect media type and get file_id
+    # detect media
     file_type, file_id = None, None
     if msg.document:
-        file_type = "document"
-        file_id = msg.document.file_id
+        file_type, file_id = "document", msg.document.file_id
     elif msg.photo:
-        file_type = "photo"
-        file_id = msg.photo[-1].file_id
+        file_type, file_id = "photo", msg.photo[-1].file_id
     elif msg.video:
-        file_type = "video"
-        file_id = msg.video.file_id
+        file_type, file_id = "video", msg.video.file_id
     elif msg.audio:
-        file_type = "audio"
-        file_id = msg.audio.file_id
+        file_type, file_id = "audio", msg.audio.file_id
     elif msg.voice:
-        file_type = "voice"
-        file_id = msg.voice.file_id
+        file_type, file_id = "voice", msg.voice.file_id
     elif msg.sticker:
-        file_type = "sticker"
-        file_id = msg.sticker.file_id
+        file_type, file_id = "sticker", msg.sticker.file_id
     else:
         await msg.reply_text("Unsupported file type.")
         return
 
-    # Forward file to channel
+    # forward to DB channel
     sent = await context.bot.copy_message(
         chat_id=DB_CHANNEL_ID,
         from_chat_id=msg.chat_id,
         message_id=msg.message_id,
     )
 
-    # Save in DB
+    # save to DB
     file_db_id = await save_file(sent.message_id, file_type, caption)
     share_link = f"https://t.me/{BOT_USERNAME}?start=share_{file_db_id}"
 
     await msg.reply_text(
-        f"✅ File saved!\nShare link: {share_link}\nID: {file_db_id}"
+        f"✅ File saved!\n"
+        f"🔗 Share link: {share_link}\n"
+        f"🆔 ID: {file_db_id}"
     )
 
-# ---------------- Send file to user ----------------
-async def send_file_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, file_db_id):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
 
+# ---------------- SEND FILE TO USER ----------------
+async def send_file_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE, file_db_id):
     cur.execute("SELECT * FROM files WHERE id=?", (file_db_id,))
     data = cur.fetchone()
     if not data:
-        await update.message.reply_text("❌ File not found or deleted.")
+        await update.message.reply_text("❌ File not found.")
         return
 
     _, file_id, file_type, caption, date, views = data
+    chat_id = update.effective_chat.id
 
-    # Send file
-    if file_type == "photo":
-        sent = await context.bot.send_photo(chat_id, file_id, caption=caption)
-    elif file_type == "video":
-        sent = await context.bot.send_video(chat_id, file_id, caption=caption)
-    elif file_type == "document":
-        sent = await context.bot.send_document(chat_id, file_id, caption=caption)
-    elif file_type == "audio":
-        sent = await context.bot.send_audio(chat_id, file_id, caption=caption)
-    elif file_type == "voice":
-        sent = await context.bot.send_voice(chat_id, file_id, caption=caption)
-    elif file_type == "sticker":
-        sent = await context.bot.send_sticker(chat_id, file_id)
-    else:
-        await update.message.reply_text("❌ Unsupported file type.")
+    # fetch actual message from DB channel
+    try:
+        file_message = await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=DB_CHANNEL_ID,
+            message_id=file_id,
+        )
+    except Exception as e:
+        await update.message.reply_text("⚠️ File couldn't be fetched. It may be missing.")
+        logger.error(str(e))
         return
 
-    # Update view count
+    # increase view count
     cur.execute("UPDATE files SET views = views + 1 WHERE id=?", (file_db_id,))
     conn.commit()
 
-    # Auto delete after 1 hour
+    # auto delete after 1h
     await context.job_queue.run_once(
-        lambda _: context.bot.delete_message(chat_id, sent.message_id),
+        lambda ctx: context.bot.delete_message(chat_id, file_message.message_id),
         TEMP_EXPIRY_SECONDS,
     )
 
     await update.message.reply_text(
-        f"⚠️ This file will be available in this chat for 60 minutes.\n"
-        f"After that it will be removed (original stays safe)."
+        "⏳ This file will stay for 1 hour. Original stays safe in storage."
     )
 
-# ---------------- /user command (admin only) ----------------
+
+# ---------------- /help ----------------
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📝 <b>Help Menu</b>\n\n"
+        "/start - Start bot or get a file via link\n"
+        "/help - Show this help message\n"
+        "/user - Admin only: List stored files\n\n"
+        "Send media to save (admin only).",
+        parse_mode="HTML",
+    )
+
+
+# ---------------- /user ----------------
 async def user_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return await update.message.reply_text("Only admin can use this command.")
@@ -244,9 +244,10 @@ async def user_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📂 <b>Stored Files</b>\n\n"
     for r in rows:
         fid, _, ftype, caption, date, views = r
-        text += f"ID: <b>{fid}</b> | Type: {ftype}\nViews: {views}\nCaption: {caption or '-'}\n\n"
+        text += f"🆔 {fid} | {ftype}\n👁 {views} views\n📄 {caption or '-'}\n\n"
 
     await update.message.reply_text(text, parse_mode="HTML")
+
 
 # ---------------- MAIN ----------------
 def main():
@@ -262,10 +263,12 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("user", user_list))
     app.add_handler(MessageHandler(media_filter, handle_file))
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
