@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-TOKEN = "YOUR_BOT_TOKEN"
+TOKEN = "8222645012:AAEQMNK31oa5hDo_9OEStfNL7FMBdZMkUFM"
 DB_CHANNEL_ID = -1003292247930  # your private DB channel id
 BOT_USERNAME = "Cornsebot"
 ADMIN_ID = 7681308594
