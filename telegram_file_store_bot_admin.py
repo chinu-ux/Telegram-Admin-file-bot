@@ -1,452 +1,225 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Mobile-friendly Telegram File Store Bot (SQLite)
-Features:
- - Force-subscribe (multi-channel) with "I Joined" check
- - /genlink, /batch, /custom_batch (basic)
- - admin system: add/del admins, list admins
- - broadcast and dbroadcast (auto-delete)
- - ban/unban/banlist
- - dlt_time / check_dlt_time
- - users, stats
- - addchnl / delchnl / listchnl / fsub_mode (toggle)
- - pbroadcast (pins in DB channel if possible)
-Notes:
- - Replace BOT_TOKEN, DB_CHANNEL_ID, ADMINS.
- - Tested with python-telegram-bot v20.x async API.
+File Store Bot
+- python-telegram-bot v20+ (async)
+- Stores admin-uploaded files into a private channel, creates deep links,
+  and serves files to users only if they joined the main channel.
+
+Usage:
+  export BOT_TOKEN="..." 
+  export MAIN_CHANNEL="@Cornsehub"     # or channel username
+  export PRIVATE_CHANNEL_ID="-1003292247930"
+  export ADMIN_IDS="7681308594"       # comma-separated admin user IDs
+  python filestore_bot.py
 """
 
-import asyncio, logging, sqlite3, os, time
-from datetime import datetime
-from typing import List, Optional
+import logging
+import os
+import sqlite3
+import uuid
+from typing import Optional
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
 )
 from telegram.ext import (
     ApplicationBuilder,
+    ContextTypes,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ContextTypes,
     filters,
 )
-from telegram.error import Forbidden, TelegramError
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = "8222645012:AAEQMNK31oa5hDo_9OEStfNL7FMBdZMkUFM"
-DB_CHANNEL_ID = -1003292247930   # channel where bot will copy/store files (use negative for channels)
-ADMINS = [7681308594]             # your Telegram user id (int). you can add more.
-DEFAULT_DELETE_AFTER = 3600      # seconds for dbroadcast auto-delete
-# ----------------------------------------
+# ------------ Config (use environment variables) -------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MAIN_CHANNEL = os.environ.get("MAIN_CHANNEL")  # e.g. "@Cornsehub" or channel ID
+PRIVATE_CHANNEL_ID = int(os.environ.get("PRIVATE_CHANNEL_ID", "-1003292247930"))
+ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger(__name__)
+if not BOT_TOKEN:
+    raise RuntimeError("Set BOT_TOKEN as environment variable")
 
-# ---------------- DATABASE ----------------
-DB_FILE = "mobile_bot.db"
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cur = conn.cursor()
+DB_PATH = "filestore.db"
 
-cur.execute("""CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    joined_at TEXT
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS banned (
-    user_id INTEGER PRIMARY KEY
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS admins (
-    user_id INTEGER PRIMARY KEY
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS dlt_time (
-    time INTEGER
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS fsub_channels (
-    channel TEXT PRIMARY KEY
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS fsub_mode (
-    enabled INTEGER PRIMARY KEY
-)""")
-conn.commit()
+# ------------ Logging -------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Ensure initial admin rows (mirror ADMINS config)
-for adm in ADMINS:
-    cur.execute("INSERT OR IGNORE INTO admins VALUES (?)", (adm,))
-conn.commit()
 
-# Default fsub mode ON
-cur.execute("INSERT OR IGNORE INTO fsub_mode VALUES (1)")
-conn.commit()
+# ------------ Database helpers -------------
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS files (
+        file_key TEXT PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        uploader_id INTEGER,
+        title TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )"""
+    )
+    con.commit()
+    con.close()
 
-# ---------------- HELPERS ----------------
-async def is_banned(user_id: int) -> bool:
-    cur.execute("SELECT 1 FROM banned WHERE user_id=?", (user_id,))
-    return cur.fetchone() is not None
 
-def is_admin_local(user_id: int) -> bool:
-    cur.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
-    return cur.fetchone() is not None
+def save_file_mapping(file_key: str, chat_id: int, message_id: int, uploader_id: Optional[int], title: Optional[str]):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO files (file_key, chat_id, message_id, uploader_id, title) VALUES (?, ?, ?, ?, ?)",
+        (file_key, chat_id, message_id, uploader_id, title),
+    )
+    con.commit()
+    con.close()
 
-async def get_fsub_channels() -> List[str]:
-    cur.execute("SELECT channel FROM fsub_channels")
-    return [r[0] for r in cur.fetchall()]
 
-def fsub_enabled() -> bool:
-    cur.execute("SELECT enabled FROM fsub_mode")
+def get_file_mapping(file_key: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT chat_id, message_id FROM files WHERE file_key = ?", (file_key,))
     row = cur.fetchone()
-    return bool(row[0]) if row else True
+    con.close()
+    return row  # None or (chat_id, message_id)
 
-async def user_register(user_id: int):
-    cur.execute("INSERT OR IGNORE INTO users VALUES (?, ?)", (user_id, datetime.utcnow().isoformat()))
-    conn.commit()
 
-async def is_user_member(bot, channel: str, user_id: int) -> bool:
-    # channel can be @username or channel_id
-    try:
-        member = await bot.get_chat_member(channel, user_id)
-        return member.status in ("member", "creator", "administrator")
-    except TelegramError:
-        return False
-
-def get_delete_time() -> int:
-    cur.execute("SELECT time FROM dlt_time")
-    r = cur.fetchone()
-    return int(r[0]) if r else DEFAULT_DELETE_AFTER
-
-# -------------- COMMANDS ----------------
-
+# ------------ Bot Handlers -------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /start and deep links like /start file_<key>"""
     user = update.effective_user
-    if await is_banned(user.id):
-        return await update.message.reply_text("🚫 You are banned from using this bot.")
+    args = context.args or []
 
-    # Force-sub check if enabled
-    if fsub_enabled():
-        chans = await get_fsub_channels()
-        if chans:
-            joined_all = True
-            for ch in chans:
-                if not await is_user_member(context.bot, ch, user.id):
-                    joined_all = False
-                    break
-            if not joined_all:
-                # build keyboard: join button(s) and check button
-                kb = []
-                for ch in chans:
-                    # show first button per channel
-                    kb.append([InlineKeyboardButton(f"Join {ch}", url=f"https://t.me/{ch.replace('@','')}")])
-                kb.append([InlineKeyboardButton("✅ I Joined", callback_data="forcecheck")])
-                await update.message.reply_text(
-                    "⚠️ To use this bot, please join the required channel(s) first.",
-                    reply_markup=InlineKeyboardMarkup(kb),
-                )
-                return
+    def join_keyboard():
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("JOIN CHANNEL", url=f"https://t.me/{MAIN_CHANNEL.lstrip('@')}")],
+                [InlineKeyboardButton("CLOSE", callback_data="close_msg")],
+            ]
+        )
 
-    # register user and welcome
-    await user_register(user.id)
-    await update.message.reply_text(f"👋 Hello {user.first_name}! Use /help to see commands.")
+    def close_keyboard():
+        return InlineKeyboardMarkup([[InlineKeyboardButton("CLOSE", callback_data="close_msg")]])
 
-async def forcecheck_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    await query.answer()
-    if not fsub_enabled():
-        return await query.edit_message_text("✅ Force-subscription is currently disabled by admin.")
-    chans = await get_fsub_channels()
-    if not chans:
-        return await query.edit_message_text("✅ No force channels are configured. You can use the bot now.")
-    # check membership
-    for ch in chans:
-        if not await is_user_member(context.bot, ch, user.id):
-            # still not joined
-            kb = [[InlineKeyboardButton(f"Join {ch}", url=f"https://t.me/{ch.replace('@','')}")],
-                  [InlineKeyboardButton("✅ I Joined", callback_data="forcecheck")]]
-            return await query.edit_message_text("⚠️ You still haven't joined. Please join then press I Joined.", reply_markup=InlineKeyboardMarkup(kb))
-    # all good
-    await user_register(user.id)
-    await query.edit_message_text(f"✅ Thanks {user.first_name}! You have joined required channels. You can now use the bot.")
-
-async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # reply to a media message -> copy to DB channel -> return start link
-    user = update.effective_user
-    if await is_banned(user.id):
-        return await update.message.reply_text("🚫 You are banned.")
-    if fsub_enabled():
-        chans = await get_fsub_channels()
-        for ch in chans:
-            if not await is_user_member(context.bot, ch, user.id):
-                return await update.message.reply_text("⚠️ Please join the required channel(s) first.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("Reply to a media message (photo/video/document/voice) to create a link.")
-    try:
-        copied = await update.message.reply_to_message.copy(chat_id=DB_CHANNEL_ID)
-    except Exception as e:
-        log.exception("Failed to copy message to DB channel")
-        return await update.message.reply_text("❌ Failed to store file. Check DB_CHANNEL_ID and bot permissions.")
-    # link uses message id in DB_CHANNEL and bot username start param
-    mid = copied.message_id
-    link = f"https://t.me/{(await context.bot.get_me()).username}?start=share_{mid}"
-    await update.message.reply_text(f"🔗 Link created:\n{link}")
-
-async def batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Simple batch: user replies to multiple messages? Telegram doesn't support multi-reply.
-    # Implementation: expects a text message with pairs "channel_or_chat_id:msgid,msgid,..." or message with space separated message ids when replying to a channel message that contains multiple media.
-    text = " ".join(context.args) if context.args else ""
-    if not text and not update.message.reply_to_message:
-        return await update.message.reply_text("Usage examples:\n1) Reply to a message that has multiple media and use /batch (bot will copy all media if present).\n2) /batch <channel_id_or_username>:<msgid1>,<msgid2>,...")
-    results = []
-    # Case A: replied to a message (if it contains album/media group, copy)
-    if update.message.reply_to_message:
-        # if reply contains media (photo, document, video, audio), copy that single message
+    # If user clicked deep link with file key
+    if args and args[0].startswith("file_"):
+        file_key = args[0]  # e.g. file_1234-uuid
+        # check membership
         try:
-            copied = await update.message.reply_to_message.copy(chat_id=DB_CHANNEL_ID)
-            mid = copied.message_id
-            link = f"https://t.me/{(await context.bot.get_me()).username}?start=share_{mid}"
-            return await update.message.reply_text(f"🔗 Copied replied message and created link:\n{link}")
+            member = await context.bot.get_chat_member(MAIN_CHANNEL, user.id)
+            # 'member.status' in ['creator','administrator','member'] means joined
+            joined = member.status not in ("left", "kicked")
         except Exception as e:
-            log.exception("batch (reply) failed")
-            return await update.message.reply_text("❌ Failed to copy replied message.")
-    # Case B: parse arg style channel:mid,mid
-    if ":" in text:
+            # Could not determine membership (maybe bot not admin in channel)
+            logger.warning("get_chat_member error: %s", e)
+            joined = False
+
+        if not joined:
+            await update.message.reply_text(
+                f"Hello 👋, {user.first_name}\n\nYou need to join my Channel/Group to use me.\n\nKindly please join the channel and then open this link again.",
+                reply_markup=join_keyboard(),
+            )
+            return
+
+        # user is a member — fetch file mapping and send file
+        mapping = get_file_mapping(file_key)
+        if not mapping:
+            await update.message.reply_text("Sorry, the file link is invalid or has expired.", reply_markup=close_keyboard())
+            return
+
+        src_chat_id, src_message_id = mapping
         try:
-            target, ids = text.split(":", 1)
-            mids = [s.strip() for s in ids.split(",") if s.strip()]
-            links = []
-            for m in mids:
-                # copy specific message id from target to DB_CHANNEL_ID
-                try:
-                    copied = await context.bot.copy_message(chat_id=DB_CHANNEL_ID, from_chat_id=target, message_id=int(m))
-                    links.append(f"https://t.me/{(await context.bot.get_me()).username}?start=share_{copied.message_id}")
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    log.exception("copy single in batch failed")
-            if links:
-                await update.message.reply_text("🔗 Batch links:\n" + "\n".join(links))
-            else:
-                await update.message.reply_text("❌ No links created.")
-        except Exception:
-            return await update.message.reply_text("❌ Invalid format. Use /batch <channel_or_username>:<msgid1>,<msgid2>")
+            # Copy the message (file) from private channel to user
+            await context.bot.copy_message(chat_id=update.effective_chat.id, from_chat_id=src_chat_id, message_id=src_message_id)
+            await update.message.reply_text("Here is your file. (Message will be deleted if you press CLOSE)", reply_markup=close_keyboard())
+        except Exception as e:
+            logger.exception("Failed to copy message: %s", e)
+            await update.message.reply_text("Failed to deliver the file. Contact admin.", reply_markup=close_keyboard())
         return
-    await update.message.reply_text("❗ Couldn't detect media to batch. Use the examples in the help.")
 
-async def custom_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Admin only: /custom_batch <channel_or_username> <msgid1,msgid2,...>
+    # Default /start (no args)
+    await update.message.reply_text(
+        f"Hello 👋, {user.first_name}\n\nYou need to join in my Channel/Group to use me\n\nKindly Please join Channel 👇",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("JOIN CHANNEL", url=f"https://t.me/{MAIN_CHANNEL.lstrip('@')}")]]),
+    )
+
+
+async def close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes the message that had the close button"""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logger.warning("Could not delete message: %s", e)
+
+
+async def handle_admin_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: send any file (document/photo/audio/video/voice) directly to bot to store it."""
     user = update.effective_user
-    if not is_admin_local(user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /custom_batch <channel> <msgid1,msgid2,...>")
-    target = context.args[0]
-    mids = context.args[1].split(",")
-    links = []
-    for m in mids:
-        try:
-            copied = await context.bot.copy_message(chat_id=DB_CHANNEL_ID, from_chat_id=target, message_id=int(m))
-            links.append(f"https://t.me/{(await context.bot.get_me()).username}?start=share_{copied.message_id}")
-            await asyncio.sleep(0.05)
-        except Exception:
-            log.exception("custom_batch copy failed")
-    if links:
-        await update.message.reply_text("🔗 Custom batch links:\n" + "\n".join(links))
-    else:
-        await update.message.reply_text("❌ No links created.")
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("You are not authorized to upload files.")
+        return
 
-async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    cur.execute("SELECT COUNT(*) FROM users")
-    c = cur.fetchone()[0]
-    await update.message.reply_text(f"👥 Total users: {c}")
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("Reply to a message to broadcast.")
-    cur.execute("SELECT user_id FROM users")
-    rows = cur.fetchall()
-    sent = 0
-    for (uid,) in rows:
-        try:
-            await update.message.reply_to_message.copy(chat_id=uid)
-            sent += 1
-            await asyncio.sleep(0.06)
-        except Forbidden:
-            # user blocked bot or cannot PM
-            pass
-        except Exception:
-            pass
-    await update.message.reply_text(f"✅ Broadcast attempted to {sent} users (sent or accepted).")
-
-async def dbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("Reply to a message to dbroadcast.")
-    delete_after = get_delete_time()
-    cur.execute("SELECT user_id FROM users")
-    rows = cur.fetchall()
-    sent = 0
-    for (uid,) in rows:
-        try:
-            m = await update.message.reply_to_message.copy(chat_id=uid)
-            sent += 1
-            # schedule deletion asynchronously
-            async def delete_later(msg, wait):
-                await asyncio.sleep(wait)
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
-            # run delete in background
-            asyncio.create_task(delete_later(m, delete_after))
-            await asyncio.sleep(0.06)
-        except Exception:
-            pass
-    await update.message.reply_text(f"✅ dbroadcast sent to {sent} users; messages will be deleted after {delete_after} sec (if possible).")
-
-async def dlt_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /dlt_time <seconds>")
+    # The incoming message may contain any media; we'll forward/copy it to the private channel.
+    sent = None
     try:
-        t = int(context.args[0])
-        cur.execute("DELETE FROM dlt_time")
-        cur.execute("INSERT INTO dlt_time VALUES (?)", (t,))
-        conn.commit()
-        await update.message.reply_text(f"✅ Set auto-delete time to {t} seconds.")
-    except ValueError:
-        await update.message.reply_text("Please provide an integer number of seconds.")
+        # Use copy_message to preserve as a channel message (avoids forwarding 'via' text)
+        copied = await context.bot.copy_message(chat_id=PRIVATE_CHANNEL_ID, from_chat_id=update.effective_chat.id, message_id=update.message.message_id)
+        # copied is a Message object from which we can get message_id
+        src_message_id = getattr(copied, "message_id", None)
+        file_key = "file_" + uuid.uuid4().hex
+        # Save mapping
+        title = None
+        if update.message.caption:
+            title = update.message.caption
+        save_file_mapping(file_key=file_key, chat_id=PRIVATE_CHANNEL_ID, message_id=src_message_id, uploader_id=user.id, title=title)
 
-async def check_dlt_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = get_delete_time()
-    await update.message.reply_text(f"🕒 Current auto-delete time: {t} sec")
+        # create deep link for your bot username
+        bot_username = (await context.bot.get_me()).username
+        deep_link = f"https://t.me/{bot_username}?start={file_key}"
 
-async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /ban <user_id>")
-    try:
-        uid = int(context.args[0])
-        cur.execute("INSERT OR IGNORE INTO banned VALUES (?)", (uid,))
-        conn.commit()
-        await update.message.reply_text(f"🚫 Banned {uid}")
-    except ValueError:
-        await update.message.reply_text("Invalid user id.")
+        await update.message.reply_text(
+            "File saved successfully.\n\nShare this link with users:\n" + deep_link + "\n\nNote: users must join the main channel to access the file."
+        )
+    except Exception as e:
+        logger.exception("Error saving file: %s", e)
+        await update.message.reply_text("Failed to save file. Make sure the bot is admin of the private channel and can post there.")
 
-async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /unban <user_id>")
-    try:
-        uid = int(context.args[0])
-        cur.execute("DELETE FROM banned WHERE user_id=?", (uid,))
-        conn.commit()
-        await update.message.reply_text(f"✅ Unbanned {uid}")
-    except ValueError:
-        await update.message.reply_text("Invalid user id.")
 
-async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    cur.execute("SELECT user_id FROM banned")
-    rows = cur.fetchall()
-    if not rows:
-        return await update.message.reply_text("✅ No banned users.")
-    await update.message.reply_text("🚫 Banned users:\n" + "\n".join(str(r[0]) for r in rows))
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Admins: send a file to bot (in private) to create a shareable link.\nUsers: open the provided link and join the channel to receive the file.")
 
-# fsub channel management
-async def addchnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /addchnl @channel_username_or_id")
-    ch = context.args[0].strip()
-    cur.execute("INSERT OR IGNORE INTO fsub_channels VALUES (?)", (ch,))
-    conn.commit()
-    await update.message.reply_text(f"✅ Added force channel {ch}")
 
-async def delchnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /delchnl @channel_username_or_id")
-    ch = context.args[0].strip()
-    cur.execute("DELETE FROM fsub_channels WHERE channel=?", (ch,))
-    conn.commit()
-    await update.message.reply_text(f"✅ Removed force channel {ch}")
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Unknown command. Use /help.")
 
-async def listchnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    cur.execute("SELECT channel FROM fsub_channels")
-    rows = cur.fetchall()
-    if not rows:
-        return await update.message.reply_text("No force channels configured.")
-    await update.message.reply_text("Force channels:\n" + "\n".join(r[0] for r in rows))
 
-async def fsub_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    cur.execute("SELECT enabled FROM fsub_mode")
-    r = cur.fetchone()
-    cur.execute("DELETE FROM fsub_mode")
-    if r and r[0]:
-        cur.execute("INSERT INTO fsub_mode VALUES (0)")
-        conn.commit()
-        return await update.message.reply_text("✅ Force-sub mode disabled.")
-    else:
-        cur.execute("INSERT INTO fsub_mode VALUES (1)")
-        conn.commit()
-        return await update.message.reply_text("✅ Force-sub mode enabled.")
+# ------------ Start the bot -------------
+def main():
+    init_db()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# admin management
-async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /add_admin <user_id>")
-    try:
-        uid = int(context.args[0])
-        cur.execute("INSERT OR IGNORE INTO admins VALUES (?)", (uid,))
-        conn.commit()
-        await update.message.reply_text(f"✅ Added admin {uid}")
-    except ValueError:
-        await update.message.reply_text("Invalid user id.")
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CallbackQueryHandler(close_callback, pattern="^close_msg$"))
 
-async def deladmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /deladmin <user_id>")
-    try:
-        uid = int(context.args[0])
-        cur.execute("DELETE FROM admins WHERE user_id=?", (uid,))
-        conn.commit()
-        await update.message.reply_text(f"✅ Removed admin {uid}")
-    except ValueError:
-        await update.message.reply_text("Invalid user id.")
+    # Admin file uploads — accept any message that contains media/document/photo/video/audio/voice
+    media_filter = filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE
+    application.add_handler(MessageHandler(media_filter & filters.ChatType.PRIVATE, handle_admin_upload))
 
-async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_local(update.effective_user.id):
-        return await update.message.reply_text("🚫 Admin only.")
-    cur.execute("SELECT user_id FROM admins")
-    rows = cur.fetchall()
-    await update.message.reply_text("Admins:\n" + "\n".join(str(r[0]) for r in rows))
+    # fallback
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # show simple uptime + DB sizes
-    uptime = time.time() - os.path.getctime(__file__) if os.path.exists(__file__) else 0
-    cur.execute("SELECT COUNT(*) FROM users")
-    users_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM banned")
-    banned_count = cur.fetchone()[0]
-    await update.message.reply_text(f"🤖 Bot running\nUptime: {int(uptime)} sec\nUsers: {users_count}\nBanned: {banned_count}")
-        
+    logger.info("Starting bot")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
